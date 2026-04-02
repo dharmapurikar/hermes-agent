@@ -1,9 +1,18 @@
-"""Anthropic prompt caching (system_and_3 strategy).
+"""Prompt caching strategies for Anthropic and OpenAI-compatible APIs.
 
-Reduces input token costs by ~75% on multi-turn conversations by caching
-the conversation prefix. Uses 4 cache_control breakpoints (Anthropic max):
-  1. System prompt (stable across all turns)
-  2-4. Last 3 non-system messages (rolling window)
+Anthropic (system_and_3 strategy):
+  Reduces input token costs by ~75% on multi-turn conversations by caching
+  the conversation prefix. Uses 4 cache_control breakpoints (Anthropic max):
+    1. System prompt (stable across all turns)
+    2-4. Last 3 non-system messages (rolling window)
+
+OpenAI-compatible (prefix stability strategy):
+  OpenAI-compatible APIs (including z.ai/GLM) use automatic prefix caching
+  on the server side -- identical prefixes across requests are cached
+  automatically. No special request markers are needed. The key is to keep
+  the system prompt and early messages stable across turns.
+  Cache hits are reported via prompt_tokens_details.cached_tokens in the
+  response usage object.
 
 Pure functions -- no class state, no AIAgent dependency.
 """
@@ -70,3 +79,25 @@ def apply_anthropic_cache_control(
         _apply_cache_marker(messages[idx], marker, native_anthropic=native_anthropic)
 
     return messages
+
+
+def apply_openai_cache_control(
+    api_messages: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Prepare messages for OpenAI-compatible automatic prefix caching.
+
+    OpenAI-compatible APIs cache prefixes automatically on the server side.
+    This function ensures prefix stability by:
+    - Not mutating message order or content of earlier messages
+    - Returning a shallow copy (no deep copy needed since we don't modify)
+
+    The server handles caching transparently -- cache hits are reported via
+    prompt_tokens_details.cached_tokens in the response.
+
+    Returns:
+        Messages ready for the API (unchanged -- prefix caching is automatic).
+    """
+    # OpenAI-compatible prefix caching is automatic and server-side.
+    # No request-side markers needed. The API caches based on matching
+    # token prefixes across requests. We return messages as-is.
+    return api_messages

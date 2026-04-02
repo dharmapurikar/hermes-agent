@@ -88,7 +88,7 @@ from agent.model_metadata import (
     save_context_length,
 )
 from agent.context_compressor import ContextCompressor
-from agent.prompt_caching import apply_anthropic_cache_control
+from agent.prompt_caching import apply_anthropic_cache_control, apply_openai_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.display import (
@@ -669,15 +669,30 @@ class AIAgent:
         self.reasoning_config = reasoning_config  # None = use default (medium for OpenRouter)
         self.prefill_messages = prefill_messages or []  # Prefilled conversation turns
         
-        # Anthropic prompt caching: auto-enabled for Claude models via OpenRouter.
-        # Reduces input costs by ~75% on multi-turn conversations by caching the
-        # conversation prefix. Uses system_and_3 strategy (4 breakpoints).
+        # Prompt caching: auto-enabled for Claude models via OpenRouter/Anthropic,
+        # and configurable for any OpenAI-compatible provider (e.g. z.ai/GLM).
+        # Anthropic: uses cache_control breakpoints (system_and_3 strategy).
+        # OpenAI-compatible: automatic server-side prefix caching (no markers needed).
         is_openrouter = self._is_openrouter_url()
         is_claude = "claude" in self.model.lower()
         is_native_anthropic = self.api_mode == "anthropic_messages"
-        self._use_prompt_caching = (is_openrouter and is_claude) or is_native_anthropic
+        self._prompt_caching_mode = "off"  # "anthropic" | "openai_compatible" | "off"
+        self._use_prompt_caching = False
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
-        
+
+        if is_native_anthropic:
+            self._prompt_caching_mode = "anthropic"
+            self._use_prompt_caching = True
+        elif is_openrouter and is_claude:
+            self._prompt_caching_mode = "anthropic"
+            self._use_prompt_caching = True
+
+        # Config-driven override: prompt_caching in config.yaml
+        # Values: "auto" (default, above logic), "enabled", "disabled"
+        # When "enabled" on a non-Anthropic provider, uses OpenAI-compatible
+        # prefix caching (automatic server-side, no request markers needed).
+        self._prompt_caching_config = "auto"  # will be overridden from config later
+
         # Iteration budget pressure: warn the LLM as it approaches max_iterations.
         # Warnings are injected into the last tool result JSON (not as separate
         # messages) so they don't break message structure or invalidate caching.
@@ -974,8 +989,11 @@ class AIAgent:
         
         # Show prompt caching status
         if self._use_prompt_caching and not self.quiet_mode:
-            source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
-            print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
+            if self._prompt_caching_mode == "anthropic":
+                source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
+                print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
+            elif self._prompt_caching_mode == "openai_compatible":
+                print(f"💾 Prompt caching: ENABLED (OpenAI-compatible prefix caching)")
         
         # Session logging setup - auto-save conversation trajectories for debugging
         self.session_start = datetime.now()
@@ -1044,6 +1062,27 @@ class AIAgent:
             _agent_cfg = _load_agent_config()
         except Exception:
             _agent_cfg = {}
+
+        # Apply config-driven prompt caching override
+        _caching_cfg = _agent_cfg.get("prompt_caching", {})
+        if isinstance(_caching_cfg, str):
+            # Support simple string value: prompt_caching: enabled
+            _caching_cfg = {"mode": _caching_cfg}
+        _caching_mode_str = str(_caching_cfg.get("mode", "auto")).lower().strip()
+        self._prompt_caching_config = _caching_mode_str
+        if _caching_mode_str == "enabled" and not self._use_prompt_caching:
+            # User explicitly enabled caching for a non-Anthropic provider.
+            # Use OpenAI-compatible prefix caching (automatic server-side).
+            self._prompt_caching_mode = "openai_compatible"
+            self._use_prompt_caching = True
+        elif _caching_mode_str == "disabled":
+            self._prompt_caching_mode = "off"
+            self._use_prompt_caching = False
+        # "auto" keeps the auto-detected values from __init__
+
+        _cache_ttl_override = _caching_cfg.get("ttl")
+        if _cache_ttl_override:
+            self._cache_ttl = str(_cache_ttl_override)
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -4728,10 +4767,19 @@ class AIAgent:
 
             # Re-evaluate prompt caching for the new provider/model
             is_native_anthropic = fb_api_mode == "anthropic_messages"
-            self._use_prompt_caching = (
-                ("openrouter" in fb_base_url.lower() and "claude" in fb_model.lower())
-                or is_native_anthropic
-            )
+            if is_native_anthropic:
+                self._prompt_caching_mode = "anthropic"
+                self._use_prompt_caching = True
+            elif "openrouter" in fb_base_url.lower() and "claude" in fb_model.lower():
+                self._prompt_caching_mode = "anthropic"
+                self._use_prompt_caching = True
+            elif self._prompt_caching_config == "enabled":
+                # Preserve user's explicit config even on fallback
+                self._prompt_caching_mode = "openai_compatible"
+                self._use_prompt_caching = True
+            else:
+                self._prompt_caching_mode = "off"
+                self._use_prompt_caching = False
 
             # Update context compressor limits for the fallback model.
             # Without this, compression decisions use the primary model's
@@ -6773,12 +6821,14 @@ class AIAgent:
                 for idx, pfm in enumerate(self.prefill_messages):
                     api_messages.insert(sys_offset + idx, pfm.copy())
 
-            # Apply Anthropic prompt caching for Claude models via OpenRouter.
-            # Auto-detected: if model name contains "claude" and base_url is OpenRouter,
-            # inject cache_control breakpoints (system + last 3 messages) to reduce
-            # input token costs by ~75% on multi-turn conversations.
+            # Apply prompt caching based on detected/configured mode.
+            # - Anthropic: inject cache_control breakpoints (system + last 3 messages)
+            # - OpenAI-compatible: prefix caching is automatic (no markers needed)
             if self._use_prompt_caching:
-                api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
+                if self._prompt_caching_mode == "anthropic":
+                    api_messages = apply_anthropic_cache_control(api_messages, cache_ttl=self._cache_ttl, native_anthropic=(self.api_mode == 'anthropic_messages'))
+                elif self._prompt_caching_mode == "openai_compatible":
+                    api_messages = apply_openai_cache_control(api_messages)
 
             # Safety net: strip orphaned tool results / add stubs for missing
             # results before sending to the API.  Runs unconditionally — not
@@ -7252,7 +7302,7 @@ class AIAgent:
                                 cached = getattr(response.usage, 'cache_read_input_tokens', 0) or 0
                                 written = getattr(response.usage, 'cache_creation_input_tokens', 0) or 0
                             else:
-                                # OpenRouter uses prompt_tokens_details.cached_tokens
+                                # OpenAI-compatible / OpenRouter: prompt_tokens_details.cached_tokens
                                 details = getattr(response.usage, 'prompt_tokens_details', None)
                                 cached = getattr(details, 'cached_tokens', 0) or 0 if details else 0
                                 written = getattr(details, 'cache_write_tokens', 0) or 0 if details else 0
