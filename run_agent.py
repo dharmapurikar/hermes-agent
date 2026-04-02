@@ -680,10 +680,7 @@ class AIAgent:
         self._use_prompt_caching = False
         self._cache_ttl = "5m"  # Default 5-minute TTL (1.25x write cost)
 
-        if is_native_anthropic:
-            self._prompt_caching_mode = "anthropic"
-            self._use_prompt_caching = True
-        elif is_openrouter and is_claude:
+        if is_native_anthropic or (is_openrouter and is_claude):
             self._prompt_caching_mode = "anthropic"
             self._use_prompt_caching = True
 
