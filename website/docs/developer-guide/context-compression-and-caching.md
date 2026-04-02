@@ -232,17 +232,20 @@ text for this purpose.
 ```
 
 
-## Prompt Caching (Anthropic)
+## Prompt Caching
 
 Source: `agent/prompt_caching.py`
 
-Reduces input token costs by ~75% on multi-turn conversations by caching the
-conversation prefix. Uses Anthropic's `cache_control` breakpoints.
+Reduces input token costs on multi-turn conversations by caching the
+conversation prefix. Supports two modes:
 
-### Strategy: system_and_3
+### Mode 1: Anthropic (cache_control breakpoints)
 
-Anthropic allows a maximum of 4 `cache_control` breakpoints per request. Hermes
-uses the "system_and_3" strategy:
+Uses Anthropic's `cache_control` breakpoints with the "system_and_3" strategy.
+Reduces input costs by ~75%. Automatically enabled for Claude models via
+OpenRouter or native Anthropic API.
+
+Anthropic allows a maximum of 4 `cache_control` breakpoints per request:
 
 ```
 Breakpoint 1: System prompt           (stable across all turns)
@@ -250,8 +253,6 @@ Breakpoint 2: 3rd-to-last non-system message  ─┐
 Breakpoint 3: 2nd-to-last non-system message   ├─ Rolling window
 Breakpoint 4: Last non-system message          ─┘
 ```
-
-### How It Works
 
 `apply_anthropic_cache_control()` deep-copies the messages and injects
 `cache_control` markers:
@@ -272,11 +273,27 @@ The marker is applied differently based on content type:
 | None/empty | Added as `msg["cache_control"]` |
 | Tool messages | Added as `msg["cache_control"]` (native Anthropic only) |
 
+### Mode 2: OpenAI-Compatible (automatic prefix caching)
+
+OpenAI-compatible APIs (including z.ai/GLM, OpenAI, DeepSeek, and others)
+use automatic server-side prefix caching. Identical token prefixes across
+requests are cached transparently — no special request markers needed.
+
+Cache hits are reported via `prompt_tokens_details.cached_tokens` in the
+response usage object. Hermes tracks and displays these stats when enabled.
+
+Enable this mode explicitly in `config.yaml` for non-Anthropic providers:
+
+```yaml
+prompt_caching:
+  mode: enabled
+```
+
 ### Cache-Aware Design Patterns
 
-1. **Stable system prompt**: The system prompt is breakpoint 1 and cached across
-   all turns. Avoid mutating it mid-conversation (compression appends a note
-   only on the first compaction).
+1. **Stable system prompt**: The system prompt is cached across all turns.
+   Avoid mutating it mid-conversation (compression appends a note only on
+   the first compaction).
 
 2. **Message ordering matters**: Cache hits require prefix matching. Adding or
    removing messages in the middle invalidates the cache for everything after.
@@ -285,8 +302,8 @@ The marker is applied differently based on content type:
    for the compressed region but the system prompt cache survives. The rolling
    3-message window re-establishes caching within 1-2 turns.
 
-4. **TTL selection**: Default is `5m` (5 minutes). Use `1h` for long-running
-   sessions where the user takes breaks between turns.
+4. **TTL selection** (Anthropic only): Default is `5m` (5 minutes). Use `1h`
+   for long-running sessions where the user takes breaks between turns.
 
 ### Enabling Prompt Caching
 
@@ -294,15 +311,19 @@ Prompt caching is automatically enabled when:
 - The model is an Anthropic Claude model (detected by model name)
 - The provider supports `cache_control` (native Anthropic API or OpenRouter)
 
+For other OpenAI-compatible providers (z.ai, DeepSeek, etc.), enable explicitly:
+
 ```yaml
-# config.yaml — TTL is configurable
-model:
-  cache_ttl: "5m"   # "5m" or "1h"
+# config.yaml
+prompt_caching:
+  mode: enabled    # "auto" (default), "enabled", or "disabled"
+  ttl: "5m"        # Anthropic TTL: "5m" or "1h" (ignored for OpenAI-compatible)
 ```
 
 The CLI shows caching status at startup:
 ```
 💾 Prompt caching: ENABLED (Claude via OpenRouter, 5m TTL)
+💾 Prompt caching: ENABLED (OpenAI-compatible prefix caching)
 ```
 
 
