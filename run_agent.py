@@ -987,13 +987,9 @@ class AIAgent:
             prompt_preview = self.ephemeral_system_prompt[:60] + "..." if len(self.ephemeral_system_prompt) > 60 else self.ephemeral_system_prompt
             print(f"🔒 Ephemeral system prompt: '{prompt_preview}' (not saved to trajectories)")
         
-        # Show prompt caching status
-        if self._use_prompt_caching and not self.quiet_mode:
-            if self._prompt_caching_mode == "anthropic":
-                source = "native Anthropic" if is_native_anthropic else "Claude via OpenRouter"
-                print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
-            elif self._prompt_caching_mode == "openai_compatible":
-                print(f"💾 Prompt caching: ENABLED (OpenAI-compatible prefix caching)")
+        # Show prompt caching status (deferred until after config override;
+        # see _show_prompt_caching_banner() called after config load).
+        self._is_native_anthropic_for_banner = is_native_anthropic
         
         # Session logging setup - auto-save conversation trajectories for debugging
         self.session_start = datetime.now()
@@ -1083,6 +1079,14 @@ class AIAgent:
         _cache_ttl_override = _caching_cfg.get("ttl")
         if _cache_ttl_override:
             self._cache_ttl = str(_cache_ttl_override)
+
+        # Show prompt caching status (after config override has been applied)
+        if self._use_prompt_caching and not self.quiet_mode:
+            if self._prompt_caching_mode == "anthropic":
+                source = "native Anthropic" if self._is_native_anthropic_for_banner else "Claude via OpenRouter"
+                print(f"💾 Prompt caching: ENABLED ({source}, {self._cache_ttl} TTL)")
+            elif self._prompt_caching_mode == "openai_compatible":
+                print(f"💾 Prompt caching: ENABLED (OpenAI-compatible prefix caching)")
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -7309,7 +7313,7 @@ class AIAgent:
                             prompt = usage_dict["prompt_tokens"]
                             hit_pct = (cached / prompt * 100) if prompt > 0 else 0
                             if not self.quiet_mode:
-                                self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)")
+                                self._vprint(f"{self.log_prefix}   💾 Cache: {cached:,}/{prompt:,} tokens ({hit_pct:.0f}% hit, {written:,} written)", force=True)
                     
                     has_retried_429 = False  # Reset on success
                     break  # Success, exit retry loop
